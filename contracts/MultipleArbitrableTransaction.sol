@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ~0.7.0;
+pragma solidity ~0.4.24;
 
 import "https://github.com/kleros/kleros-interaction/blob/master/contracts/standard/arbitration/MultipleArbitrableTransaction.sol";
 import "./ERC20.sol";
