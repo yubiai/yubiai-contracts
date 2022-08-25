@@ -5,6 +5,7 @@ pragma abicoder v2;
 import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.4-solc-0.7/contracts/token/ERC20/ERC20.sol";
 import "./IMultipleArbitrableTransaction.sol";
 
+
 contract PaymentProcessor {
     IMultipleArbitrableTransaction multipleArbitrableAddress;
     uint256 public DIVISOR = 100;
@@ -13,7 +14,6 @@ contract PaymentProcessor {
     address payable public burnAddress;
 
     struct TransferInfo {
-        uint256 amount;
         address token;
         uint256 tokenETHRate;
         bool ETHPriceGreaterThanToken;
@@ -49,6 +49,10 @@ contract PaymentProcessor {
         multipleArbitrableAddress = IMultipleArbitrableTransaction(arbitrableAddress);
     }
 
+    function getAdminFee() external view returns (uint fee) {
+        return adminFee;
+    }
+
     function changeAdminFee(uint256 newAdminFee) external {
         require(msg.sender == address(admin), "Unauthorized");
         require(newAdminFee < DIVISOR, "Fee too big");
@@ -62,13 +66,13 @@ contract PaymentProcessor {
         TransactionData memory _transactionData
     ) public payable returns (uint transactionID) {
         require(burnFee + adminFee < DIVISOR, "Fee too big");
-        uint256 burnAmount = _transferInfo.amount / DIVISOR * burnFee;
-        uint256 adminAmount = _transferInfo.amount / DIVISOR * adminFee;
-        uint256 receiverAmount = _transferInfo.amount - burnAmount - adminAmount;
+        uint256 burnAmount = msg.value / DIVISOR * burnFee;
+        uint256 adminAmount = msg.value / DIVISOR * adminFee;
+        uint256 receiverAmount = msg.value - burnAmount - adminAmount;
 
-        if (_transferInfo.tokenETHRate != 0) {
+        if (_transferInfo.tokenETHRate > 1) {
             uint256 baseAmountInETH = _transferInfo.ETHPriceGreaterThanToken
-                ? _transferInfo.amount / _transferInfo.tokenETHRate : _transferInfo.amount * _transferInfo.tokenETHRate;
+                ? msg.value / _transferInfo.tokenETHRate : msg.value * _transferInfo.tokenETHRate;
             burnAmount = baseAmountInETH / DIVISOR * burnFee;
             adminAmount = baseAmountInETH / DIVISOR * adminFee;
         }
@@ -100,12 +104,32 @@ contract PaymentProcessor {
         uint256 burnAmount,
         uint256 adminAmount
     ) public payable returns (uint256 transactionID) {
-        return multipleArbitrableAddress.createTransaction(
+        if (_tokenAddress != address(0)) {
+            IERC20 token = IERC20(_tokenAddress);
+            // Transfers token from sender wallet to contract. Permit before transfer
+            require(
+                token.transferFrom(msg.sender, address(this), _amount),
+                "Sender does not have enough approved funds."
+            );
+            token.approve(address(multipleArbitrableAddress), _amount);
+            return multipleArbitrableAddress.createTokenTransaction{value: adminAmount + burnAmount}(
+                _transactionData.timeoutPayment,
+                _transactionData.sender,
+                _transactionData.receiver,
+                _transactionData.metaEvidence,
+                _amount,
+                _tokenAddress,
+                admin,
+                adminAmount,
+                burnAddress,
+                burnAmount
+            );
+        }
+        return multipleArbitrableAddress.createETHTransaction{value: _amount + burnAmount + adminAmount}(
             _transactionData.timeoutPayment,
             _transactionData.sender,
             _transactionData.receiver,
             _transactionData.metaEvidence,
-            _tokenAddress,
             _amount,
             admin,
             adminAmount,

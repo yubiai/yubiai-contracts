@@ -1,31 +1,108 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ~0.4.24;
+pragma solidity ~0.7.6;
+pragma abicoder v2;
 
-import "https://github.com/kleros/kleros-interaction/blob/master/contracts/standard/arbitration/MultipleArbitrableTransaction.sol";
+import "./deps/Arbitrator.sol";
+import "./deps/IArbitrable.sol";
 import "./ERC20.sol";
 
-contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
-    ExtendedTransaction[] public transactions;
+contract YubiaiMultipleArbitrableTransaction is IArbitrable {
+    // **************************** //
+    // *    Contract variables    * //
+    // **************************** //
+
+    uint8 constant AMOUNT_OF_CHOICES = 2;
+    uint8 constant SENDER_WINS = 1;
+    uint8 constant RECEIVER_WINS = 2;
+
+    enum Party {Sender, Receiver}
+    enum Status {NoDispute, WaitingSender, WaitingReceiver, DisputeCreated, Resolved}
 
     struct WalletFee {
-        address wallet;
+        address payable wallet;
         uint fee;
     }
 
+    struct Transaction {
+        address payable sender;
+        address payable receiver;
+        uint amount;
+        uint timeoutPayment; // Time in seconds after which the transaction can be automatically executed if not disputed.
+        uint disputeId; // If dispute exists, the ID of the dispute.
+        uint senderFee; // Total fees paid by the sender.
+        uint receiverFee; // Total fees paid by the receiver.
+        uint lastInteraction; // Last interaction for the dispute procedure.
+        Status status;
+    }
+
     struct ExtendedTransaction {
-        IERC20 token;
+        address token;
         Transaction _transaction;
         WalletFee adminFee;
         WalletFee burnFee;
     }
 
+    ExtendedTransaction[] public transactions;
+    bytes public arbitratorExtraData; // Extra data to set up the arbitration.
+    Arbitrator public arbitrator; // Address of the arbitrator contract.
+    uint public feeTimeout; // Time in seconds a party can take to pay arbitration fees before being considered unresponding and lose the dispute.
+
+
+    mapping (uint => uint) public disputeIDtoTransactionID; // One-to-one relationship between the dispute and the transaction.
+
+    // **************************** //
+    // *          Events          * //
+    // **************************** //
+
+    /** @dev To be emitted when a party pays or reimburses the other.
+     *  @param _transactionID The index of the transaction.
+     *  @param _amount The amount paid.
+     *  @param _party The party that paid.
+     */
+    event Payment(uint indexed _transactionID, uint _amount, address _party);
+
+    /** @dev Indicate that a party has to pay a fee or would otherwise be considered as losing.
+     *  @param _transactionID The index of the transaction.
+     *  @param _party The party who has to pay.
+     */
+    event HasToPayFee(uint indexed _transactionID, Party _party);
+
+    /** @dev To be raised when a ruling is given.
+     *  @param _arbitrator The arbitrator giving the ruling.
+     *  @param _disputeID ID of the dispute in the Arbitrator contract.
+     *  @param _ruling The ruling which was given.
+     */
+    // event Ruling(Arbitrator indexed _arbitrator, uint indexed _disputeID, uint _ruling);
+
+    /** @dev Emitted when a transaction is created.
+     *  @param _transactionID The index of the transaction.
+     *  @param _sender The address of the sender.
+     *  @param _receiver The address of the receiver.
+     *  @param _amount The initial amount in the transaction.
+     */
+    event TransactionCreated(uint _transactionID, address indexed _sender, address indexed _receiver, uint _amount);
+
+    // **************************** //
+    // *    Arbitrable functions  * //
+    // *    Modifying the state   * //
+    // **************************** //
+
+    /** @dev Constructor.
+     *  @param _arbitrator The arbitrator of the contract.
+     *  @param _arbitratorExtraData Extra data for the arbitrator.
+     *  @param _feeTimeout Arbitration fee timeout for the parties.
+     */
     constructor (
         Arbitrator _arbitrator,
-        bytes _arbitratorExtraData,
+        bytes memory _arbitratorExtraData,
         uint _feeTimeout
-    ) MultipleArbitrableTransaction(_arbitrator, _arbitratorExtraData, _feeTimeout) public { }
+    ) {
+        arbitrator = _arbitrator;
+        arbitratorExtraData = _arbitratorExtraData;
+        feeTimeout = _feeTimeout;
+    }
 
-    function receive() external payable { }
+    receive() external payable { }
 
     function compareStrings(string memory a, string memory b) private pure returns (bool) {
         return (keccak256(abi.encodePacked((a))) == keccak256(abi.encodePacked((b))));
@@ -41,10 +118,36 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
         }
     }
 
-    function getRawTransaction(
-        address _sender,
-        address _receiver
-    ) private view returns (Transaction) {
+    function handleTransactionTransfer(
+        uint _transactionID,
+        address payable destination,
+        uint amount,
+        uint finalAmount,
+        bool isToken,
+        string memory feeMode,
+        bool emitPayment
+    ) public {
+        ExtendedTransaction memory transaction = transactions[_transactionID];
+        if (isToken) {
+            require(
+                IERC20(transaction.token).transfer(destination, amount),
+                "The `transfer` function must not fail."
+            );
+        } else {
+            destination.transfer(amount);
+        }
+        transaction._transaction.amount = finalAmount;
+        performTransactionFee(transaction, feeMode);
+
+        if (emitPayment) {
+            emit Payment(_transactionID, amount, msg.sender);
+        }
+    }
+
+    function initTransaction(
+        address payable _sender,
+        address payable _receiver
+    ) private view returns (Transaction memory) {
         return Transaction({
             sender: _sender,
             receiver: _receiver,
@@ -53,51 +156,120 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
             disputeId: 0,
             senderFee: 0,
             receiverFee: 0,
-            lastInteraction: now,
+            lastInteraction: block.timestamp,
             status: Status.NoDispute
         });
     }
 
-    /** @dev Create a transaction.
+    /** @dev Create a ETH-based transaction.
      *  @param _timeoutPayment Time after which a party can automatically execute the arbitrable transaction.
      *  @param _sender The recipient of the transaction.
      *  @param _receiver The recipient of the transaction.
      *  @param _metaEvidence Link to the meta-evidence.
-     *  @param _tokenAddress Address of token used for transaction.
-     *  @param _amount Amount of the the transaction.
      *  @param _adminWallet Admin fee wallet.
      *  @param _adminFeeAmount Admin fee amount.
      *  @param _burnWallet Burn fee wallet.
      *  @param _burnFeeAmount Burn fee amount.
      *  @return transactionID The index of the transaction.
      **/
-    function createTransaction(
+    function createETHTransaction(
         uint _timeoutPayment,
-        address _sender,
-        address _receiver,
-        string _metaEvidence,
-        address _tokenAddress,
-        uint _amount,
-        address _adminWallet,
+        address payable _sender,
+        address payable _receiver,
+        string memory _metaEvidence,
+        uint256 _amount,
+        address payable _adminWallet,
         uint _adminFeeAmount,
-        address _burnWallet,
+        address payable _burnWallet,
         uint _burnFeeAmount
     ) public payable returns (uint transactionID) {
+        require(
+            _amount + _burnFeeAmount + _adminFeeAmount == msg.value,
+            "Fees or amounts don't match with payed amount."
+        );
+        address(this).transfer(msg.value);
+
+        return createTransaction(
+            _timeoutPayment,
+            _sender,
+            _receiver,
+            _metaEvidence,
+            _amount,
+            address(0),
+            _adminWallet,
+            _adminFeeAmount,
+            _burnWallet,
+            _burnFeeAmount
+        );
+    }
+
+    /** @dev Create a token-based transaction.
+     *  @param _timeoutPayment Time after which a party can automatically execute the arbitrable transaction.
+     *  @param _sender The recipient of the transaction.
+     *  @param _receiver The recipient of the transaction.
+     *  @param _metaEvidence Link to the meta-evidence.
+     *  @param _tokenAddress Address of token used for transaction.
+     *  @param _adminWallet Admin fee wallet.
+     *  @param _adminFeeAmount Admin fee amount.
+     *  @param _burnWallet Burn fee wallet.
+     *  @param _burnFeeAmount Burn fee amount.
+     *  @return transactionID The index of the transaction.
+     **/
+    function createTokenTransaction(
+        uint _timeoutPayment,
+        address payable _sender,
+        address payable _receiver,
+        string memory _metaEvidence,
+        uint256 _amount,
+        address _tokenAddress,
+        address payable _adminWallet,
+        uint _adminFeeAmount,
+        address payable _burnWallet,
+        uint _burnFeeAmount
+    ) public payable returns (uint transactionID) {
+        IERC20 token = IERC20(_tokenAddress);
+        // Transfers token from sender wallet to contract. Permit before transfer
+        require(
+            token.transferFrom(msg.sender, address(this), _amount),
+            "Sender does not have enough approved funds."
+        );
+        require(
+            _adminFeeAmount + _burnFeeAmount == msg.value,
+            "Fees don't match with payed amount"
+        );
+
+        return createTransaction(
+            _timeoutPayment,
+            _sender,
+            _receiver,
+            _metaEvidence,
+            _amount,
+            _tokenAddress,
+            _adminWallet,
+            _adminFeeAmount,
+            _burnWallet,
+            _burnFeeAmount
+        );
+    }
+
+    function createTransaction(
+        uint _timeoutPayment,
+        address payable _sender,
+        address payable _receiver,
+        string memory _metaEvidence,
+        uint256 _amount,
+        address _token,
+        address payable _adminWallet,
+        uint _adminFeeAmount,
+        address payable _burnWallet,
+        uint _burnFeeAmount
+    ) private returns (uint transactionID) {
         WalletFee memory _adminFee = WalletFee(_adminWallet, _adminFeeAmount);
         WalletFee memory _burnFee = WalletFee(_burnWallet, _burnFeeAmount);
-        Transaction memory _rawTransaction = getRawTransaction(_sender, _receiver);
+        Transaction memory _rawTransaction = initTransaction(_sender, _receiver);
+
         _rawTransaction.amount = _amount;
         _rawTransaction.timeoutPayment = _timeoutPayment;
-
-        IERC20 _token;
-        if (address(_tokenAddress) != address(0)) {
-            _token = IERC20(_tokenAddress);
-            // Transfers token from sender wallet to contract.
-            require(
-                _token.transferFrom(msg.sender, address(this), _amount),
-                "Sender does not have enough approved funds."
-            );
-        }
 
         ExtendedTransaction memory _transaction = ExtendedTransaction({
             token: _token,
@@ -105,6 +277,7 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
             adminFee: _adminFee,
             burnFee: _burnFee
         });
+
         transactions.push(_transaction);
         emit MetaEvidence(transactions.length - 1, _metaEvidence);
 
@@ -121,10 +294,15 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
         require(transaction._transaction.status == Status.NoDispute, "The transaction shouldn't be disputed.");
         require(_amount <= transaction._transaction.amount, "The amount paid has to be less than or equal to the transaction.");
 
-        transaction._transaction.receiver.transfer(_amount);
-        transaction._transaction.amount -= _amount;
-        performTransactionFee(transaction, "pay");
-        emit Payment(_transactionID, _amount, msg.sender);
+        handleTransactionTransfer(
+            _transactionID,
+            transaction._transaction.receiver,
+            _amount,
+            _amount,
+            transaction.token != address(0),
+            "pay",
+            true
+        );
     }
 
     /** @dev Reimburse sender. To be called if the good or service can't be fully provided.
@@ -137,10 +315,15 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
         require(transaction._transaction.status == Status.NoDispute, "The transaction shouldn't be disputed.");
         require(_amountReimbursed <= transaction._transaction.amount, "The amount reimbursed has to be less or equal than the transaction.");
 
-        transaction._transaction.sender.transfer(_amountReimbursed);
-        transaction._transaction.amount -= _amountReimbursed;
-        performTransactionFee(transaction, "reimburse");
-        emit Payment(_transactionID, _amountReimbursed, msg.sender);
+        handleTransactionTransfer(
+            _transactionID,
+            transaction._transaction.sender,
+            _amountReimbursed,
+            _amountReimbursed,
+            transaction.token != address(0),
+            "reimburse",
+            true
+        );
     }
 
     /** @dev Transfer the transaction's amount to the receiver if the timeout has passed.
@@ -148,12 +331,18 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
      */
     function executeTransaction(uint _transactionID) public {
         ExtendedTransaction storage transaction = transactions[_transactionID];
-        require(now - transaction._transaction.lastInteraction >= transaction._transaction.timeoutPayment, "The timeout has not passed yet.");
+        require(block.timestamp - transaction._transaction.lastInteraction >= transaction._transaction.timeoutPayment, "The timeout has not passed yet.");
         require(transaction._transaction.status == Status.NoDispute, "The transaction shouldn't be disputed.");
 
-        transaction._transaction.receiver.transfer(transaction._transaction.amount);
-        transaction._transaction.amount = 0;
-        performTransactionFee(transaction, "pay");
+        handleTransactionTransfer(
+            _transactionID,
+            transaction._transaction.receiver,
+            transaction._transaction.amount,
+            0,
+            transaction.token != address(0),
+            "pay",
+            false
+        );
 
         transaction._transaction.status = Status.Resolved;
     }
@@ -165,7 +354,7 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
         ExtendedTransaction storage transaction = transactions[_transactionID];
 
         require(transaction._transaction.status == Status.WaitingReceiver, "The transaction is not waiting on the receiver.");
-        require(now - transaction._transaction.lastInteraction >= feeTimeout, "Timeout time has not passed yet.");
+        require(block.timestamp - transaction._transaction.lastInteraction >= feeTimeout, "Timeout time has not passed yet.");
 
         executeRuling(_transactionID, SENDER_WINS);
     }
@@ -177,7 +366,7 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
         ExtendedTransaction storage transaction = transactions[_transactionID];
 
         require(transaction._transaction.status == Status.WaitingSender, "The transaction is not waiting on the sender.");
-        require(now - transaction._transaction.lastInteraction >= feeTimeout, "Timeout time has not passed yet.");
+        require(block.timestamp - transaction._transaction.lastInteraction >= feeTimeout, "Timeout time has not passed yet.");
 
         executeRuling(_transactionID, RECEIVER_WINS);
     }
@@ -198,7 +387,7 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
         // Require that the total pay at least the arbitration cost.
         require(transaction._transaction.senderFee >= arbitrationCost, "The sender fee must cover arbitration costs.");
 
-        transaction._transaction.lastInteraction = now;
+        transaction._transaction.lastInteraction = block.timestamp;
 
         // The receiver still has to pay. This can also happen if he has paid, but arbitrationCost has increased.
         if (transaction._transaction.receiverFee < arbitrationCost) {
@@ -225,7 +414,7 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
         // Require that the total paid to be at least the arbitration cost.
         require(transaction._transaction.receiverFee >= arbitrationCost, "The receiver fee must cover arbitration costs.");
 
-        transaction._transaction.lastInteraction = now;
+        transaction._transaction.lastInteraction = block.timestamp;
         // The sender still has to pay. This can also happen if he has paid, but arbitrationCost has increased.
         if (transaction._transaction.senderFee < arbitrationCost) {
             transaction._transaction.status = Status.WaitingSender;
@@ -242,7 +431,7 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
     function raiseDispute(uint _transactionID, uint _arbitrationCost) internal {
         ExtendedTransaction storage transaction = transactions[_transactionID];
         transaction._transaction.status = Status.DisputeCreated;
-        transaction._transaction.disputeId = arbitrator.createDispute.value(_arbitrationCost)(AMOUNT_OF_CHOICES, arbitratorExtraData);
+        transaction._transaction.disputeId = arbitrator.createDispute{value: _arbitrationCost}(AMOUNT_OF_CHOICES, arbitratorExtraData);
         disputeIDtoTransactionID[transaction._transaction.disputeId] = _transactionID;
         emit Dispute(arbitrator, transaction._transaction.disputeId, _transactionID, _transactionID);
 
@@ -286,18 +475,23 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
      */
     function appeal(uint _transactionID) public payable {
         ExtendedTransaction storage transaction = transactions[_transactionID];
-
-        arbitrator.appeal.value(msg.value)(transaction._transaction.disputeId, arbitratorExtraData);
+        arbitrator.appeal{value: msg.value}(transaction._transaction.disputeId, arbitratorExtraData);
     }
-
 
     /** @dev Give a ruling for a dispute. Must be called by the arbitrator.
      *  The purpose of this function is to ensure that the address calling it has the right to rule on the contract.
      *  @param _disputeID ID of the dispute in the Arbitrator contract.
      *  @param _ruling Ruling given by the arbitrator. Note that 0 is reserved for "Not able/wanting to make a decision".
      */
-    function rule(uint _disputeID, uint _ruling) public {
-        super.rule(_disputeID, _ruling);
+    function rule(uint _disputeID, uint _ruling) override public {
+        uint transactionID = disputeIDtoTransactionID[_disputeID];
+        ExtendedTransaction storage transaction = transactions[transactionID];
+        require(msg.sender == address(arbitrator), "The caller must be the arbitrator.");
+        require(transaction._transaction.status == Status.DisputeCreated, "The dispute has already been resolved.");
+
+        emit Ruling(Arbitrator(msg.sender), _disputeID, _ruling);
+
+        executeRuling(transactionID, _ruling);
     }
 
     /** @dev Execute a ruling of a dispute. It reimburses the fee to the winning party.
@@ -305,7 +499,29 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
      *  @param _ruling Ruling given by the arbitrator. 1 : Reimburse the receiver. 2 : Pay the sender.
      */
     function executeRuling(uint _transactionID, uint _ruling) internal {
-        super.executeRuling(_transactionID, _ruling);
+        ExtendedTransaction storage transaction = transactions[_transactionID];
+        require(_ruling <= AMOUNT_OF_CHOICES, "Invalid ruling.");
+
+        // Give the arbitration fee back.
+        // Note that we use send to prevent a party from blocking the execution.
+        /* TODO: Check how to handle fee */
+        if (_ruling == SENDER_WINS) {
+            transaction._transaction.sender.transfer(transaction._transaction.senderFee + transaction._transaction.amount);
+            performTransactionFee(transaction, "reimburse");
+        } else if (_ruling == RECEIVER_WINS) {
+            transaction._transaction.receiver.transfer(transaction._transaction.receiverFee + transaction._transaction.amount);
+            performTransactionFee(transaction, "pay");
+        } else {
+            uint split_amount = (transaction._transaction.senderFee + transaction._transaction.amount) / 2;
+            transaction._transaction.sender.transfer(split_amount);
+            transaction._transaction.receiver.transfer(split_amount);
+            performTransactionFee(transaction, "reimburse");
+        }
+
+        transaction._transaction.amount = 0;
+        transaction._transaction.senderFee = 0;
+        transaction._transaction.receiverFee = 0;
+        transaction._transaction.status = Status.Resolved;
     }
 
     // **************************** //
@@ -316,7 +532,7 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
      *  @return countTransactions The count of transactions.
      */
     function getCountTransactions() public view returns (uint countTransactions) {
-        return super.getCountTransactions();
+        return transactions.length;
     }
 
     /** @dev Get IDs for transactions where the specified address is the receiver and/or the sender.
@@ -325,7 +541,20 @@ contract YubiaiMultipleArbitrableTransaction is MultipleArbitrableTransaction {
      *  @param _address The specified address.
      *  @return transactionIDs The transaction IDs.
      */
-    function getTransactionIDsByAddress(address _address) public view returns (uint[] transactionIDs) {
-        return super.getTransactionIDsByAddress(_address);
+    function getTransactionIDsByAddress(address _address) public view returns (uint[] memory transactionIDs) {
+        uint count = 0;
+        for (uint i = 0; i < transactions.length; i++) {
+            if (transactions[i]._transaction.sender == _address || transactions[i]._transaction.receiver == _address)
+                count++;
+        }
+
+        transactionIDs = new uint[](count);
+
+        count = 0;
+
+        for (uint j = 0; j < transactions.length; j++) {
+            if (transactions[j]._transaction.sender == _address || transactions[j]._transaction.receiver == _address)
+                transactionIDs[count++] = j;
+        }
     }
 }
