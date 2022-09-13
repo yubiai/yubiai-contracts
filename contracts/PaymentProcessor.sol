@@ -86,40 +86,68 @@ contract PaymentProcessor {
         address token,
         uint256 amount,
         uint256 deadline
-    ) public returns (uint256) {
-        address[] memory path = new address[](2);
-        path[0] = address(token);
-        path[1] = address(WETH);
-        /* TODO: Approve token to being used by Uniswap contract */
+    ) private returns (uint256) {
+        if (amount > 0) {
+            address[] memory path = new address[](2);
+            path[0] = address(token);
+            path[1] = address(WETH);
 
-        uint256[] memory amounts = IUniswapV2Router(UNISWAP_V2_ROUTER).swapExactTokensForETH(
-            amount, 1, path, address(this), deadline);
+            IERC20 iToken = IERC20(token);
+            require(
+                iToken.transferFrom(msg.sender, address(this), amount),
+                "Sender does not have enough approved funds."
+            );
+            iToken.approve(UNISWAP_V2_ROUTER, amount * 10);
 
-        return amounts[0];
+            uint256[] memory amounts = IUniswapV2Router(UNISWAP_V2_ROUTER).swapExactTokensForETH(
+                amount, 1, path, address(this), deadline);
+
+            return amounts[0];
+        } 
+        return 0;
     }
 
 
     /*
-        Entry point to manage payment and create transaction used in Yubiai.
+        Entry points to manage payment and create transaction used in Yubiai.
+        manageETHPayment, manageTokenPayment
     */
-    function managePayment(
+    function manageETHPayment(
         uint paymentId,
         uint256 burnFee,
-        TransferInfo memory _transferInfo,
         TransactionData memory _transactionData
     ) public payable returns (uint transactionID) {
         require(burnFee + adminFee < DIVISOR, "Fee too big");
         uint256 burnAmount = msg.value / DIVISOR * burnFee;
         uint256 adminAmount = msg.value / DIVISOR * adminFee;
         uint256 receiverAmount = msg.value - burnAmount - adminAmount;
-        uint256 constDeadline = 5000000;
 
-        if (_transferInfo.isToken) {
-            burnAmount = getETHFromTokens(_transferInfo.token, msg.value / DIVISOR * burnFee, constDeadline);
-            adminAmount = getETHFromTokens(_transferInfo.token, msg.value / DIVISOR * adminFee, constDeadline);
-        }
+        uint256 transactionIndex = createTransaction(
+            _transactionData,
+            address(0),
+            receiverAmount,
+            burnAmount,
+            adminAmount
+        );
 
-        /* Calculate fee, token or ETH, based only on ETH wei value */
+        emit PaymentDone(msg.sender, receiverAmount, paymentId, block.timestamp);
+        emit MetaEvidence(transactionIndex, _transactionData.metaEvidence);
+
+        return transactionIndex;
+    }
+
+    function manageTokenPayment(
+        uint256 tokenAmount,
+        uint paymentId,
+        uint256 burnFee,
+        TransferInfo memory _transferInfo,
+        TransactionData memory _transactionData
+    ) public returns (uint transactionID) {
+        require(burnFee + adminFee < DIVISOR, "Fee too big");
+        uint256 constDeadline = block.timestamp + 1000000;
+        uint256 burnAmount = getETHFromTokens(_transferInfo.token, tokenAmount / DIVISOR * burnFee, constDeadline);
+        uint256 adminAmount = getETHFromTokens(_transferInfo.token, tokenAmount / DIVISOR * adminFee, constDeadline);
+        uint256 receiverAmount = tokenAmount - burnAmount - adminAmount;
 
         uint256 transactionIndex = createTransaction(
             _transactionData,
